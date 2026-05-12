@@ -33,7 +33,7 @@ fi
 if [[ -z "${IMAGE_REF// }" ]]; then
   echo "error: IMAGE_REF is required (registry/repo/path:tag)." >&2
   echo "  Pass as the first argument, or set TWISTLOCK_IMAGE_REF." >&2
-  echo "  example: $0 '986019062625.dkr.ecr.us-east-1.amazonaws.com/crdc-mdb-sts-fast-api/main:104'" >&2
+  echo "  example: $0 '123456789.dkr.ecr.us-east-1.amazonaws.com/my-repo/main:100'" >&2
   echo "  example: export TWISTLOCK_IMAGE_REF='...'; $0" >&2
   exit 1
 fi
