@@ -1,13 +1,23 @@
 #!/usr/bin/env bash
 # Authenticate, POST on-demand registry scan, optional NCI scan/select, poll until compact registry has data.
 #
+#   Token authentication is recommended:
+#   ./run_twistlock.sh -token 'JWT' -i 'registry/repo:tag' -i 'registry/other:tag'
+#   ./run_twistlock.sh --token 'JWT' --image 'registry/repo:tag'
+#   ./run_twistlock.sh -t 'JWT' 'registry/repo:tag' 'registry/other:tag'
+#   export TWISTLOCK_TOKEN='...'   # optional; CLI token overrides env
+#
+#   Username/password is kept only as a fallback and is not recommended:
 #   export TWISTLOCK_USERNAME='...' TWISTLOCK_PASSWORD='...'
-#   ./run_twistlock.sh [IMAGE_REF]
+#   ./run_twistlock.sh [--image|-i 'registry/repo:tag']...   # or positional image refs
 #
 # Env:
-#   TWISTLOCK_IMAGE_REF — full image ref if not passed as first arg (required: use $1 or this var)
+#   TWISTLOCK_IMAGE_REF — image if not set via --image/-i or positional refs
+#   TWISTLOCK_TOKEN — Bearer (skips /authenticate); CLI --token overrides
+#   TWISTLOCK_USERNAME, TWISTLOCK_PASSWORD — fallback only; token auth is recommended
 #   TWISTLOCK_ADDRESS, TWISTLOCK_API_VERSION
 #   TWISTLOCK_POLL_MAX (default 60), TWISTLOCK_POLL_INTERVAL (default 15) — seconds between polls
+#   TWISTLOCK_VERBOSE=1 — print detailed API request/response progress
 #   TWISTLOCK_SKIP_SCAN_SELECT=1 — skip POST /api/v1/registry/scan/select (otherwise sent with NCI defaults)
 #   TWISTLOCK_SCAN_SELECT_COLLECTIONS, TWISTLOCK_SCAN_SELECT_PROJECT — override scan/select query
 # After poll: GET compact=false, then print CVE table (embedded python, same parsing as twistlock_scan).
@@ -15,41 +25,145 @@
 
 set -euo pipefail
 
+_looks_like_jwt() {
+  local s="${1:-}" j1 j2 j3 rest
+  [[ "$s" == ey[Jj]* ]] || return 1
+  IFS='.' read -r j1 j2 j3 rest <<< "$s"
+  [[ -n "$j1" && -n "$j2" && -n "$j3" && -z "${rest:-}" ]] || return 1
+  [[ "$j2" != */* ]] || return 1
+  return 0
+}
+
+CLI_TOKEN=""
+CLI_IMAGES=()
+POS_IMAGES=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --token=* | -token=*)
+      CLI_TOKEN="${1#--token=}"
+      CLI_TOKEN="${CLI_TOKEN#-token=}"
+      shift
+      ;;
+    --token | -token | -t)
+      if [[ $# -lt 2 ]]; then
+        echo "error: $1 requires a value" >&2
+        exit 1
+      fi
+      CLI_TOKEN="$2"
+      shift 2
+      ;;
+    --image=*)
+      CLI_IMAGES+=("${1#--image=}")
+      shift
+      ;;
+    --image | -i)
+      if [[ $# -lt 2 ]]; then
+        echo "error: $1 requires a value" >&2
+        exit 1
+      fi
+      CLI_IMAGES+=("$2")
+      shift 2
+      ;;
+    --help | -h)
+      echo "usage: $0 [options] [IMAGE_REF ...]" >&2
+      echo "  -token|--token|-t TOKEN  Bearer JWT (recommended; skips username/password login)" >&2
+      echo "  --image|-i REF           container image registry/repo:tag; repeat for multiple images" >&2
+      echo "  IMAGE_REF ...            optional positional images" >&2
+      echo "  env: TWISTLOCK_TOKEN (recommended), TWISTLOCK_IMAGE_REF, TWISTLOCK_VERBOSE=1" >&2
+      echo "       TWISTLOCK_USERNAME+PASSWORD are fallback only and not recommended" >&2
+      exit 0
+      ;;
+    --)
+      shift
+      while [[ $# -gt 0 ]]; do
+        POS_IMAGES+=("$1")
+        shift
+      done
+      break
+      ;;
+    -*)
+      echo "error: unknown option: $1 (try --help)" >&2
+      exit 1
+      ;;
+    *)
+      POS_IMAGES+=("$1")
+      shift
+      ;;
+  esac
+done
+
+IMAGE_REFS=()
+if [[ ${#CLI_IMAGES[@]} -gt 0 ]]; then
+  IMAGE_REFS+=("${CLI_IMAGES[@]}")
+fi
+if [[ ${#POS_IMAGES[@]} -gt 0 ]]; then
+  IMAGE_REFS+=("${POS_IMAGES[@]}")
+fi
+if [[ ${#IMAGE_REFS[@]} -eq 0 && -n "${TWISTLOCK_IMAGE_REF:-}" ]]; then
+  IMAGE_REFS=("$TWISTLOCK_IMAGE_REF")
+fi
+
 ADDRESS="${TWISTLOCK_ADDRESS:-https://twistlock.nci.nih.gov}"
 ADDRESS="${ADDRESS%/}"
 API_VERSION="${TWISTLOCK_API_VERSION:-v34.02}"
-IMAGE_REF="${1:-${TWISTLOCK_IMAGE_REF:-}}"
 POLL_MAX="${TWISTLOCK_POLL_MAX:-60}"
 POLL_INTERVAL="${TWISTLOCK_POLL_INTERVAL:-15}"
+VERBOSE="${TWISTLOCK_VERBOSE:-0}"
 
 TL_USER="${TWISTLOCK_USERNAME:-}"
 TL_PASS="${TWISTLOCK_PASSWORD:-}"
+TL_TOKEN="${CLI_TOKEN:-${TWISTLOCK_TOKEN:-}}"
+TOKEN_FROM_CLI=0
+[[ -n "${CLI_TOKEN:-}" ]] && TOKEN_FROM_CLI=1
 
-if [[ -z "$TL_USER" || -z "$TL_PASS" ]]; then
-  echo "error: set TWISTLOCK_USERNAME and TWISTLOCK_PASSWORD" >&2
+USE_PREAUTH_TOKEN=0
+if [[ -n "$TL_TOKEN" ]]; then
+  USE_PREAUTH_TOKEN=1
+elif [[ -z "$TL_USER" || -z "$TL_PASS" ]]; then
+  echo "error: set -token/--token/-t or TWISTLOCK_TOKEN, or TWISTLOCK_USERNAME and TWISTLOCK_PASSWORD" >&2
   exit 1
 fi
 
-if [[ -z "${IMAGE_REF// }" ]]; then
-  echo "error: IMAGE_REF is required (registry/repo/path:tag)." >&2
-  echo "  Pass as the first argument, or set TWISTLOCK_IMAGE_REF." >&2
-  echo "  example: $0 '123456789.dkr.ecr.us-east-1.amazonaws.com/my-repo/main:100'" >&2
-  echo "  example: export TWISTLOCK_IMAGE_REF='...'; $0" >&2
+if [[ ${#IMAGE_REFS[@]} -eq 0 ]]; then
+  echo "error: at least one image ref is required (registry/repo:tag)." >&2
+  echo "  $0 -token 'JWT' -i 'registry/repo:tag' -i 'registry/other:tag'" >&2
+  echo "  $0 --image 'registry/repo:tag'   # with TWISTLOCK_TOKEN or username/password in env" >&2
+  echo "  $0 'registry/repo:tag' 'registry/other:tag'  # positional images" >&2
   exit 1
 fi
 
-if [[ "$IMAGE_REF" != */*:* ]]; then
-  echo "error: IMAGE_REF must be registry/repo/path:tag" >&2
-  exit 1
+validate_image_ref() {
+  local image_ref="$1"
+  if [[ -z "${image_ref// }" ]]; then
+    echo "error: empty image ref is not allowed." >&2
+    exit 1
+  fi
+  if [[ "$image_ref" == -* ]]; then
+    echo "error: image ref looks like a flag (${image_ref}). Use --image '...'." >&2
+    exit 1
+  fi
+  if [[ -n "${image_ref// }" ]] && _looks_like_jwt "$image_ref"; then
+    echo "error: image value looks like a JWT. Use separate parameters, e.g.:" >&2
+    echo "  $0 -token 'JWT' -i 'registry.example.com/repo:tag'" >&2
+    exit 1
+  fi
+  if [[ "$image_ref" != */*:* ]]; then
+    echo "error: image must be registry/repository:tag (with / and :)." >&2
+    echo "  got: ${image_ref}" >&2
+    exit 1
+  fi
+}
+
+for IMAGE_REF in "${IMAGE_REFS[@]}"; do
+  validate_image_ref "$IMAGE_REF"
+done
+
+if [[ "$USE_PREAUTH_TOKEN" == 1 ]]; then
+  AUTH_BODY=""
+else
+  AUTH_BODY=$(TL_USER="$TL_USER" TL_PASS="$TL_PASS" python3 -c \
+    'import json, os; print(json.dumps({"username": os.environ["TL_USER"], "password": os.environ["TL_PASS"]}))')
 fi
-
-REGISTRY="${IMAGE_REF%%/*}"
-REST="${IMAGE_REF#*/}"
-REPO="${REST%:*}"
-TAG="${REST##*:}"
-
-AUTH_BODY=$(TL_USER="$TL_USER" TL_PASS="$TL_PASS" python3 -c \
-  'import json, os; print(json.dumps({"username": os.environ["TL_USER"], "password": os.environ["TL_PASS"]}))')
 
 json_token() {
   python3 -c 'import json,sys; d=json.load(sys.stdin); t=d.get("token"); print(t or "", end="")'
@@ -73,20 +187,47 @@ raise SystemExit(0)
 '
 }
 
-echo "==> POST ${ADDRESS}/api/v1/authenticate"
-AUTH_JSON=$(curl -k -sS -X POST "${ADDRESS}/api/v1/authenticate" \
-  -H "Content-Type: application/json" \
-  -d "$AUTH_BODY") || true
+if [[ "$USE_PREAUTH_TOKEN" == 1 ]]; then
+  TOKEN="$TL_TOKEN"
+  if [[ "$TOKEN_FROM_CLI" == 1 ]]; then
+    echo "==> auth: using Bearer from CLI token (skipping POST /api/v1/authenticate)"
+  else
+    echo "==> auth: using TWISTLOCK_TOKEN (skipping POST /api/v1/authenticate)"
+  fi
+  echo "    ok (token length ${#TOKEN})"
+else
+  echo "==> POST ${ADDRESS}/api/v1/authenticate"
+  AUTH_JSON=$(curl -k -sS -X POST "${ADDRESS}/api/v1/authenticate" \
+    -H "Content-Type: application/json" \
+    -d "$AUTH_BODY") || true
 
-TOKEN=$(printf '%s' "$AUTH_JSON" | json_token)
-if [[ -z "$TOKEN" ]]; then
-  echo "authenticate failed (no token). body:" >&2
-  echo "$AUTH_JSON" >&2
-  exit 1
+  TOKEN=$(printf '%s' "$AUTH_JSON" | json_token)
+  if [[ -z "$TOKEN" ]]; then
+    echo "authenticate failed (no token). body:" >&2
+    echo "$AUTH_JSON" >&2
+    exit 1
+  fi
+  echo "    ok (token length ${#TOKEN})"
 fi
-echo "    ok (token length ${#TOKEN})"
 
-echo "==> GET registry compact (before scan) name=${IMAGE_REF}"
+REPORT_TMP_ROOT=$(mktemp -d)
+trap 'rm -rf "${REPORT_TMP_ROOT}"' EXIT
+REPORT_FILES=()
+REPORT_TITLES=()
+REPORT_STATUSES=()
+
+scan_image() {
+  local IMAGE_REF="$1"
+  local REGISTRY REST REPO TAG SELECT_STATUS POLLS_USED REPORT_TMP REPORT_FILE
+
+  REGISTRY="${IMAGE_REF%%/*}"
+  REST="${IMAGE_REF#*/}"
+  REPO="${REST%:*}"
+  TAG="${REST##*:}"
+
+if [[ "$VERBOSE" == "1" ]]; then
+  echo "    GET registry compact (before scan)"
+fi
 REG_RAW=$(curl -k -sS -G "${ADDRESS}/api/${API_VERSION}/registry" \
   --data-urlencode "name=${IMAGE_REF}" \
   --data-urlencode "compact=true" \
@@ -94,12 +235,16 @@ REG_RAW=$(curl -k -sS -G "${ADDRESS}/api/${API_VERSION}/registry" \
   -w "\n%{http_code}")
 REG_HTTP=$(printf '%s' "$REG_RAW" | tail -n1)
 REG=$(printf '%s' "$REG_RAW" | sed '$d')
-echo "    HTTP ${REG_HTTP} preview: $(printf '%s' "$REG" | head -c 80)"
+if [[ "$VERBOSE" == "1" ]]; then
+  echo "      HTTP ${REG_HTTP} preview: $(printf '%s' "$REG" | head -c 80)"
+fi
 
 export REGISTRY REPO TAG
 SCAN_BODY=$(python3 -c 'import json, os; print(json.dumps({"onDemandScan": True, "tag": {"registry": os.environ["REGISTRY"], "repo": os.environ["REPO"], "tag": os.environ["TAG"], "digest": ""}}))')
 
-echo "==> POST ${ADDRESS}/api/${API_VERSION}/registry/scan (on-demand)"
+if [[ "$VERBOSE" == "1" ]]; then
+  echo "    POST ${ADDRESS}/api/${API_VERSION}/registry/scan (on-demand)"
+fi
 SCAN_RAW=$(curl -k -sS --max-time 240 -X POST "${ADDRESS}/api/${API_VERSION}/registry/scan" \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer ${TOKEN}" \
@@ -107,16 +252,19 @@ SCAN_RAW=$(curl -k -sS --max-time 240 -X POST "${ADDRESS}/api/${API_VERSION}/reg
   -w "\n%{http_code}")
 SCAN_HTTP=$(printf '%s' "$SCAN_RAW" | tail -n1)
 SCAN_BODY_OUT=$(printf '%s' "$SCAN_RAW" | sed '$d')
-echo "    HTTP ${SCAN_HTTP}"
-if [[ -n "$SCAN_BODY_OUT" ]]; then
+echo "    scan: HTTP ${SCAN_HTTP}"
+if [[ "$VERBOSE" == "1" && -n "$SCAN_BODY_OUT" ]]; then
   echo "    body: ${SCAN_BODY_OUT}"
 fi
 if [[ "$SCAN_HTTP" != 2* ]]; then
+  if [[ -n "$SCAN_BODY_OUT" ]]; then
+    echo "    scan error: ${SCAN_BODY_OUT}" >&2
+  fi
   echo "error: registry/scan failed" >&2
-  exit 1
+  return 1
 fi
-echo "    ok"
 
+SELECT_STATUS="skipped"
 if [[ "${TWISTLOCK_SKIP_SCAN_SELECT:-0}" != "1" ]]; then
   COLLECTIONS="${TWISTLOCK_SCAN_SELECT_COLLECTIONS:-CRDC CCDI All Collection}"
   PROJECT="${TWISTLOCK_SCAN_SELECT_PROJECT:-Central Console}"
@@ -131,7 +279,9 @@ print(os.environ["ADDRESS"].rstrip("/") + "/api/v1/registry/scan/select?" + q)
 '
   )
   SELECT_BODY=$(python3 -c 'import json, os; print(json.dumps([{"tag": {"registry": os.environ["REGISTRY"], "repo": "", "tag": ""}}]))')
-  echo "==> POST registry/scan/select (notify defenders; may run many minutes) …"
+  if [[ "$VERBOSE" == "1" ]]; then
+    echo "    POST registry/scan/select (notify defenders; may run many minutes)"
+  fi
   SEL_RAW=$(curl -k -sS --max-time 1800 -X POST "$SELECT_URL" \
     -H "Content-Type: application/json" \
     -H "Authorization: Bearer ${TOKEN}" \
@@ -139,14 +289,20 @@ print(os.environ["ADDRESS"].rstrip("/") + "/api/v1/registry/scan/select?" + q)
     -w "\n%{http_code}")
   SEL_HTTP=$(printf '%s' "$SEL_RAW" | tail -n1)
   SEL_OUT=$(printf '%s' "$SEL_RAW" | sed '$d')
-  echo "    HTTP ${SEL_HTTP}"
-  if [[ -n "$SEL_OUT" ]]; then
+  SELECT_STATUS="HTTP ${SEL_HTTP}"
+  echo "    select: ${SELECT_STATUS}"
+  if [[ "$VERBOSE" == "1" && -n "$SEL_OUT" ]]; then
     echo "    body (first 500 chars): $(printf '%.500s' "$SEL_OUT")"
   fi
+else
+  echo "    select: skipped"
 fi
 
-echo "==> Poll GET registry compact (max ${POLL_MAX} tries, ${POLL_INTERVAL}s apart)"
+if [[ "$VERBOSE" == "1" ]]; then
+  echo "    Poll GET registry compact (max ${POLL_MAX} tries, ${POLL_INTERVAL}s apart)"
+fi
 found=0
+POLLS_USED=0
 for ((i = 1; i <= POLL_MAX; i++)); do
   REG_RAW=$(curl -k -sS -G "${ADDRESS}/api/${API_VERSION}/registry" \
     --data-urlencode "name=${IMAGE_REF}" \
@@ -156,24 +312,32 @@ for ((i = 1; i <= POLL_MAX; i++)); do
   REG_HTTP=$(printf '%s' "$REG_RAW" | tail -n1)
   REG=$(printf '%s' "$REG_RAW" | sed '$d')
   if printf '%s' "$REG" | compact_ready; then
-    echo "    poll #${i}: HTTP ${REG_HTTP} — compact payload ready"
+    POLLS_USED="$i"
+    if [[ "$VERBOSE" == "1" ]]; then
+      echo "      poll #${i}: HTTP ${REG_HTTP} - compact payload ready"
+    fi
     found=1
     break
   fi
-  echo "    poll #${i}: HTTP ${REG_HTTP} — not ready yet (e.g. null); sleep ${POLL_INTERVAL}s"
+  if [[ "$VERBOSE" == "1" ]]; then
+    echo "      poll #${i}: HTTP ${REG_HTTP} - not ready yet; sleep ${POLL_INTERVAL}s"
+  fi
   sleep "$POLL_INTERVAL"
 done
 
 if [[ "$found" != 1 ]]; then
   echo "error: timed out without compact registry row for ${IMAGE_REF}" >&2
-  exit 1
+  return 1
 fi
+echo "    poll: ready after ${POLLS_USED} attempt(s)"
 
-REPORT_TMP=$(mktemp -d)
-trap 'rm -rf "${REPORT_TMP}"' EXIT
+REPORT_TMP=$(mktemp -d "${REPORT_TMP_ROOT}/image.XXXXXX")
+REPORT_FILE="${REPORT_TMP}/report.txt"
 printf '%s' "$REG" > "${REPORT_TMP}/compact.json"
 
-echo "==> GET registry detailed (compact=false) for CVE table" >&2
+if [[ "$VERBOSE" == "1" ]]; then
+  echo "    GET registry detailed (compact=false) for CVE table" >&2
+fi
 DETAILED_HTTP=$(
   curl -k -sS --max-time 300 -G "${ADDRESS}/api/${API_VERSION}/registry" \
     --data-urlencode "name=${IMAGE_REF}" \
@@ -186,11 +350,11 @@ if [[ "$DETAILED_HTTP" != 2* ]]; then
   echo "    warning: detailed GET HTTP ${DETAILED_HTTP}; CVE table uses compact JSON only" >&2
   cp "${REPORT_TMP}/compact.json" "${REPORT_TMP}/detailed.json"
 else
-  echo "    HTTP ${DETAILED_HTTP}" >&2
+  echo "    detail: HTTP ${DETAILED_HTTP}" >&2
 fi
 
 export TL_COMPACT="${REPORT_TMP}/compact.json" TL_DETAILED="${REPORT_TMP}/detailed.json" TL_MICRO="${REPO}"
-python3 <<'PY'
+python3 > "${REPORT_FILE}" <<'PY'
 import json, os, re, time
 from pathlib import Path
 
@@ -359,7 +523,9 @@ else:
 emit_table_only(detailed_payload, os.environ["TL_MICRO"])
 PY
 
-echo "==> GET registry/progress repo=${REPO} tag=${TAG}" >&2
+if [[ "$VERBOSE" == "1" ]]; then
+  echo "    GET registry/progress repo=${REPO} tag=${TAG}" >&2
+fi
 PROG_RAW=$(curl -k -sS -G "${ADDRESS}/api/${API_VERSION}/registry/progress" \
   --data-urlencode "onDemand=true" \
   --data-urlencode "repo=${REPO}" \
@@ -368,6 +534,50 @@ PROG_RAW=$(curl -k -sS -G "${ADDRESS}/api/${API_VERSION}/registry/progress" \
   -w "\n%{http_code}")
 PROG_HTTP=$(printf '%s' "$PROG_RAW" | tail -n1)
 PROG=$(printf '%s' "$PROG_RAW" | sed '$d')
-echo "    HTTP ${PROG_HTTP}" >&2
-printf '%s\n' "$PROG" >&2
+if [[ "$VERBOSE" == "1" ]]; then
+  echo "      HTTP ${PROG_HTTP}" >&2
+  printf '%s\n' "$PROG" >&2
+fi
+
+REPORT_FILES+=("$REPORT_FILE")
+REPORT_TITLES+=("${IMAGE_REF}")
+REPORT_STATUSES+=("scan ${SCAN_HTTP}, select ${SELECT_STATUS}, detail ${DETAILED_HTTP}, progress ${PROG_HTTP}")
+}
+
+TOTAL_IMAGES=${#IMAGE_REFS[@]}
+IMAGE_INDEX=0
+FAILED_IMAGES=()
+for IMAGE_REF in "${IMAGE_REFS[@]}"; do
+  IMAGE_INDEX=$((IMAGE_INDEX + 1))
+  echo "==> image ${IMAGE_INDEX}/${TOTAL_IMAGES}: ${IMAGE_REF}"
+  if scan_image "$IMAGE_REF"; then
+    echo "==> image ${IMAGE_INDEX}/${TOTAL_IMAGES}: completed"
+  else
+    echo "==> image ${IMAGE_INDEX}/${TOTAL_IMAGES}: failed" >&2
+    FAILED_IMAGES+=("$IMAGE_REF")
+  fi
+done
+
+if [[ ${#REPORT_FILES[@]} -gt 0 ]]; then
+  echo
+  echo "Vulnerability report"
+  echo "===================="
+  for ((i = 0; i < ${#REPORT_FILES[@]}; i++)); do
+    echo
+    echo "Image $((i + 1))/${#REPORT_FILES[@]}: ${REPORT_TITLES[$i]}"
+    echo "Status: ${REPORT_STATUSES[$i]}"
+    echo
+    cat "${REPORT_FILES[$i]}"
+  done
+fi
+
+if [[ ${#FAILED_IMAGES[@]} -gt 0 ]]; then
+  echo >&2
+  echo "error: ${#FAILED_IMAGES[@]} image(s) failed:" >&2
+  for IMAGE_REF in "${FAILED_IMAGES[@]}"; do
+    echo "  - ${IMAGE_REF}" >&2
+  done
+  exit 1
+fi
+
 echo "done." >&2

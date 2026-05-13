@@ -2,7 +2,22 @@
 
 ## `run_twistlock.sh`
 
-- Set credentials, then run with one image argument (same shape as `twistlock_scan`).
+### Token + image (recommended)
+
+```bash
+./run_twistlock.sh -token 'eyJ...' \
+  -i '1236456789.dkr.ecr.us-east-1.amazonaws.com/my-repo:main.100' \
+  -i '1236456789.dkr.ecr.us-east-1.amazonaws.com/other-repo:main.101'
+./run_twistlock.sh --token 'eyJ...' --image '1236456789.dkr.ecr.us-east-1.amazonaws.com/my-repo:main.100'
+# short flags (order among flags is free)
+./run_twistlock.sh -i '1236456789.dkr.ecr.us-east-1.amazonaws.com/my-repo:main.100' -t 'eyJ...'
+```
+
+For safer usage, prefer a short-lived Twistlock token. You can also set `TWISTLOCK_TOKEN` and pass only `--image '...'`, repeat `-i/--image`, or pass multiple positional image refs.
+
+### User + password (not recommended)
+
+Username/password authentication is kept only as a fallback for older workflows. Avoid it when possible because it increases credential exposure risk; use token authentication instead.
 
 ```bash
 export TWISTLOCK_USERNAME='...'
