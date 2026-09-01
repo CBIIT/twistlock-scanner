@@ -1,5 +1,52 @@
 # Scripts
 
+## Reusable GitHub Actions workflow
+
+The reusable workflow at `.github/workflows/reusable-twistlock-scan.yml` scans
+one or more private ECR images from the CBIIT self-hosted runner. It retrieves
+the Twistlock `username` and `password` from AWS Secrets Manager, prints a scan
+summary and vulnerability table, and fails when any Critical or High finding
+is present.
+
+Store the Twistlock credential in Secrets Manager as JSON:
+
+```json
+{
+  "username": "TWISTLOCK_ACCESS_KEY_ID",
+  "password": "TWISTLOCK_SECRET_KEY"
+}
+```
+
+The assumed AWS role must trust the calling GitHub repository through OIDC and
+must be able to pull the requested ECR images and call
+`secretsmanager:GetSecretValue` for the configured secret. Add `kms:Decrypt`
+when the secret uses a customer-managed KMS key.
+
+Caller example—the image list is the only workflow input:
+
+```yaml
+jobs:
+  twistlock:
+    permissions:
+      contents: read
+      id-token: write
+    uses: CBIIT/twistlock-scanner/.github/workflows/reusable-twistlock-scan.yml@v1
+    with:
+      images: '["123456789012.dkr.ecr.us-east-1.amazonaws.com/service:tag"]'
+      environment: build
+```
+
+The reusable workflow owns the fixed `us-east-1` region and `prod/twistlock`
+secret ID. Set `environment` to the caller environment that already contains
+`AWS_BUILD_ROLE_TO_ASSUME`. No Twistlock credential is stored in GitHub.
+
+If `AWS_BUILD_ROLE_TO_ASSUME` is a repository or organization secret instead of
+an environment secret, pass it with `secrets: inherit`.
+
+Use a release tag or full commit SHA instead of a test branch for team usage.
+If this repository is private, allow the intended organization repositories in
+**Settings → Actions → General → Access**.
+
 ## `run_twistlock.sh`
 
 ### Token + image (recommended)
