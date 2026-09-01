@@ -1,0 +1,457 @@
+name: Reusable Twistlock Image Scan
+
+# Example caller:
+# jobs:
+#   twistlock:
+#     permissions:
+#       contents: read
+#       id-token: write
+#     uses: CBIIT/twistlock-scanner/.github/workflows/reusable-twistlock-scan.yml@v1
+#     with:
+#       images: '["123456789012.dkr.ecr.us-east-1.amazonaws.com/service:tag"]'
+#       environment: build
+
+permissions:
+  contents: read
+  id-token: write
+
+on:
+  workflow_call:
+    inputs:
+      images:
+        description: 'JSON array of tagged ECR references; each entry can be fully qualified or repository:tag'
+        required: true
+        type: string
+      aws_region:
+        description: AWS region containing the ECR images and Twistlock secret
+        required: false
+        default: us-east-1
+        type: string
+      environment:
+        description: Caller environment containing AWS_BUILD_ROLE_TO_ASSUME
+        required: false
+        default: build
+        type: string
+      twistlock_url:
+        description: Prisma Cloud Compute (Twistlock) Console URL
+        required: false
+        default: https://twistlock.nci.nih.gov
+        type: string
+      twistlock_secret_id:
+        description: AWS Secrets Manager secret containing Twistlock username and password
+        required: false
+        default: prod/twistlock
+        type: string
+      insecure_twistcli_download:
+        description: Skip TLS certificate verification only while downloading twistcli
+        required: false
+        default: true
+        type: boolean
+    secrets:
+      AWS_BUILD_ROLE_TO_ASSUME:
+        description: Optional repository or organization IAM role secret; environment secret takes precedence
+        required: false
+
+  workflow_dispatch:
+    inputs:
+      images:
+        description: 'JSON array of tagged ECR references; each entry can be fully qualified or repository:tag'
+        required: true
+        type: string
+      aws_region:
+        description: AWS region containing the ECR images and Twistlock secret
+        required: false
+        default: us-east-1
+        type: string
+      environment:
+        description: GitHub environment containing AWS_BUILD_ROLE_TO_ASSUME
+        required: false
+        default: build
+        type: environment
+      twistlock_url:
+        description: Prisma Cloud Compute (Twistlock) Console URL
+        required: false
+        default: https://twistlock.nci.nih.gov
+        type: string
+      twistlock_secret_id:
+        description: AWS Secrets Manager secret containing Twistlock username and password
+        required: false
+        default: prod/twistlock
+        type: string
+      insecure_twistcli_download:
+        description: Skip TLS certificate verification only while downloading twistcli
+        required: false
+        default: true
+        type: boolean
+
+jobs:
+  validate:
+    name: Validate Twistlock scan request
+    runs-on: ubuntu-latest
+    outputs:
+      images: ${{ steps.images.outputs.images }}
+    steps:
+      - name: Validate image list
+        id: images
+        env:
+          IMAGES_JSON: ${{ inputs.images }}
+        run: |
+          python3 - <<'PYTHON'
+          import json
+          import os
+
+          try:
+              images = json.loads(os.environ["IMAGES_JSON"])
+          except json.JSONDecodeError as exc:
+              raise SystemExit(f"images must be valid JSON: {exc}") from exc
+
+          if not isinstance(images, list) or not images:
+              raise SystemExit("images must be a non-empty JSON array")
+          if any(not isinstance(image, str) or not image.strip() for image in images):
+              raise SystemExit("every images entry must be a non-empty string")
+          images = [image.strip() for image in images]
+          if len(set(images)) != len(images):
+              raise SystemExit("images must not contain duplicate references")
+
+          normalized = json.dumps(images, separators=(",", ":"))
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(f"images={normalized}\n")
+          PYTHON
+
+  scan:
+    name: Twistlock Scan - ${{ matrix.image }}
+    needs: validate
+    runs-on:
+      group: cbiit-global-runners
+      labels: [nonprod-org-runner]
+    environment: ${{ inputs.environment }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ${{ fromJSON(needs.validate.outputs.images) }}
+    env:
+      AWS_REGION: ${{ inputs.aws_region }}
+      AWS_ROLE_TO_ASSUME: ${{ secrets.AWS_BUILD_ROLE_TO_ASSUME }}
+      IMAGE_INPUT: ${{ matrix.image }}
+      TWISTLOCK_URL: ${{ inputs.twistlock_url }}
+      TWISTLOCK_SECRET_ID: ${{ inputs.twistlock_secret_id }}
+
+    steps:
+      - name: Validate scan inputs and runner
+        id: target
+        run: |
+          set -Eeuo pipefail
+
+          if [[ -z "${AWS_ROLE_TO_ASSUME}" || -z "${TWISTLOCK_SECRET_ID}" ]]; then
+            echo "AWS_BUILD_ROLE_TO_ASSUME and twistlock_secret_id are required." >&2
+            exit 1
+          fi
+
+          if [[ "${IMAGE_INPUT}" != *:* || "${IMAGE_INPUT}" == *@* ]]; then
+            echo "Image must be a tagged ECR reference: ${IMAGE_INPUT}" >&2
+            exit 1
+          fi
+
+          first_component="${IMAGE_INPUT%%/*}"
+          if [[ "${IMAGE_INPUT}" == */* && "${first_component}" == *.* && "${first_component}" != *.dkr.ecr.*.amazonaws.com ]]; then
+            echo "Only private Amazon ECR image references are supported: ${IMAGE_INPUT}" >&2
+            exit 1
+          fi
+
+          docker info >/dev/null
+
+      - name: Configure AWS credentials with OIDC
+        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502 # v4.0.2
+        with:
+          aws-region: ${{ inputs.aws_region }}
+          role-to-assume: ${{ env.AWS_ROLE_TO_ASSUME }}
+          role-session-name: GitHubActions-Twistlock
+          unset-current-credentials: true
+
+      - name: Load Twistlock credentials from AWS Secrets Manager
+        run: |
+          set -Eeuo pipefail
+
+          secret_json=$(aws secretsmanager get-secret-value \
+            --region "${AWS_REGION}" \
+            --secret-id "${TWISTLOCK_SECRET_ID}" \
+            --query SecretString \
+            --output text)
+          export SECRET_JSON="${secret_json}"
+
+          TWISTLOCK_USERNAME=$(python3 -c 'import json, os; print(json.loads(os.environ["SECRET_JSON"])["username"])')
+          TWISTLOCK_PASSWORD=$(python3 -c 'import json, os; print(json.loads(os.environ["SECRET_JSON"])["password"])')
+
+          if [[ -z "${TWISTLOCK_USERNAME}" || -z "${TWISTLOCK_PASSWORD}" ]]; then
+            echo "Secrets Manager secret ${TWISTLOCK_SECRET_ID} must contain non-empty username and password values." >&2
+            exit 1
+          fi
+          if [[ "${TWISTLOCK_USERNAME}" == *$'\n'* || "${TWISTLOCK_USERNAME}" == *$'\r'* || \
+                "${TWISTLOCK_PASSWORD}" == *$'\n'* || "${TWISTLOCK_PASSWORD}" == *$'\r'* ]]; then
+            echo "Twistlock credentials must not contain newline characters." >&2
+            exit 1
+          fi
+
+          echo "::add-mask::${TWISTLOCK_USERNAME}"
+          echo "::add-mask::${TWISTLOCK_PASSWORD}"
+          {
+            echo "TWISTLOCK_USERNAME=${TWISTLOCK_USERNAME}"
+            echo "TWISTLOCK_PASSWORD=${TWISTLOCK_PASSWORD}"
+          } >> "${GITHUB_ENV}"
+
+      - name: Resolve ECR image reference
+        id: image
+        run: |
+          set -Eeuo pipefail
+
+          first_component="${IMAGE_INPUT%%/*}"
+          if [[ "${first_component}" == *.dkr.ecr.*.amazonaws.com ]]; then
+            registry="${first_component}"
+            image_ref="${IMAGE_INPUT}"
+          else
+            account_id=$(aws sts get-caller-identity --query Account --output text)
+            registry="${account_id}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+            image_ref="${registry}/${IMAGE_INPUT}"
+          fi
+
+          {
+            echo "registry=${registry}"
+            echo "image_ref=${image_ref}"
+          } >> "${GITHUB_OUTPUT}"
+          echo "IMAGE_REF=${image_ref}" >> "${GITHUB_ENV}"
+
+      - name: Log in to Amazon ECR
+        env:
+          ECR_REGISTRY: ${{ steps.image.outputs.registry }}
+        run: |
+          set -Eeuo pipefail
+          aws ecr get-login-password --region "${AWS_REGION}" \
+            | docker login --username AWS --password-stdin "${ECR_REGISTRY}"
+
+      - name: Pull image from ECR
+        run: |
+          set -Eeuo pipefail
+          echo "Pulling ${IMAGE_REF}"
+          docker pull "${IMAGE_REF}"
+
+      - name: Download twistcli from the internal Console
+        env:
+          INSECURE_DOWNLOAD: ${{ inputs.insecure_twistcli_download }}
+        run: |
+          set -Eeuo pipefail
+
+          twistcli_path="${RUNNER_TEMP}/twistcli"
+          curl_args=(
+            --fail
+            --silent
+            --show-error
+            --location
+            --user "${TWISTLOCK_USERNAME}:${TWISTLOCK_PASSWORD}"
+            --output "${twistcli_path}"
+          )
+          if [[ "${INSECURE_DOWNLOAD}" == "true" ]]; then
+            curl_args+=(--insecure)
+          fi
+
+          curl "${curl_args[@]}" "${TWISTLOCK_URL%/}/api/v1/util/twistcli"
+          test -s "${twistcli_path}"
+          chmod 0755 "${twistcli_path}"
+          echo "TWISTCLI_PATH=${twistcli_path}" >> "${GITHUB_ENV}"
+          "${twistcli_path}" --version
+
+      - name: Run Twistlock scan
+        id: twistlock
+        run: |
+          set -uo pipefail
+
+          scan_json="${RUNNER_TEMP}/twistlock-scan.json"
+          scan_log="${RUNNER_TEMP}/twistlock-scan.log"
+          echo "Scanning ${IMAGE_REF}"
+
+          set +e
+          "${TWISTCLI_PATH}" images scan \
+            --address "${TWISTLOCK_URL}" \
+            --user "${TWISTLOCK_USERNAME}" \
+            --password "${TWISTLOCK_PASSWORD}" \
+            --output-file "${scan_json}" \
+            "${IMAGE_REF}" 2>&1 | tee "${scan_log}"
+          scan_exit_code=${PIPESTATUS[0]}
+          set -e
+
+          {
+            echo "exit_code=${scan_exit_code}"
+            echo "json=${scan_json}"
+            echo "log=${scan_log}"
+          } >> "${GITHUB_OUTPUT}"
+
+          # Validate the scanner exit code after the JSON report is summarized.
+          exit 0
+
+      - name: Summarize scan results
+        env:
+          SCAN_JSON: ${{ steps.twistlock.outputs.json }}
+        run: |
+          python3 - <<'PYTHON'
+          import json
+          import os
+          import pathlib
+
+          scan_path = pathlib.Path(os.environ["SCAN_JSON"])
+          if not scan_path.is_file() or scan_path.stat().st_size == 0:
+              raise SystemExit(f"Twistlock did not produce a JSON report: {scan_path}")
+
+          try:
+              payload = json.loads(scan_path.read_text())
+          except (OSError, json.JSONDecodeError) as exc:
+              raise SystemExit(f"Could not parse Twistlock JSON report: {exc}") from exc
+
+          findings = []
+
+          def collect(value):
+              if isinstance(value, dict):
+                  vulnerabilities = value.get("vulnerabilities")
+                  if isinstance(vulnerabilities, list):
+                      findings.extend(item for item in vulnerabilities if isinstance(item, dict))
+                  for key, nested in value.items():
+                      if key != "vulnerabilities":
+                          collect(nested)
+              elif isinstance(value, list):
+                  for nested in value:
+                      collect(nested)
+
+          collect(payload)
+
+          counts = {"critical": 0, "high": 0, "medium": 0, "low": 0}
+          for finding in findings:
+              severity = str(finding.get("severity") or "").strip().lower()
+              if severity in counts:
+                  counts[severity] += 1
+
+          result = {
+              "image": os.environ["IMAGE_REF"],
+              "critical": counts["critical"],
+              "high": counts["high"],
+              "medium": counts["medium"],
+              "low": counts["low"],
+              "total": len(findings),
+          }
+
+          def plain(value, default="-"):
+              return str(value or default).replace("|", "\\|").replace("\n", " ")
+
+          def identified_date(finding):
+              value = finding.get("discoveredDate") or finding.get("publishedDate")
+              return str(value).split("T", 1)[0] if value else "-"
+
+          image_name = result["image"].rsplit("/", 1)[-1]
+          microservice = image_name.rsplit(":", 1)[0]
+          detail_rows = [
+              (
+                  microservice,
+                  finding.get("id") or finding.get("cve") or "-",
+                  finding.get("cve") or "-",
+                  str(finding.get("severity") or "-").title(),
+                  identified_date(finding),
+                  finding.get("packageName") or "-",
+              )
+              for finding in findings
+          ]
+
+          print(
+              f"image='{result['image']}' microservice='{microservice}' "
+              f"parsed_cve_rows={len(detail_rows)}"
+          )
+          if detail_rows:
+              headers = (
+                  "Microservice",
+                  "CVE identifier",
+                  "CVE ID",
+                  "Severity",
+                  "Date identified",
+                  "Package",
+              )
+              printable_rows = [tuple(plain(value) for value in row) for row in detail_rows]
+              widths = [
+                  max(len(headers[index]), *(len(row[index]) for row in printable_rows))
+                  for index in range(len(headers))
+              ]
+
+              def format_row(row):
+                  return " | ".join(value.ljust(widths[index]) for index, value in enumerate(row))
+
+              print(format_row(headers))
+              print("-+-".join("-" * width for width in widths))
+              for row in printable_rows:
+                  print(format_row(row))
+          else:
+              print("No vulnerabilities found.")
+
+          def clean(value):
+              return str(value or "").replace("|", "\\|").replace("\n", " ")
+
+          lines = [
+              "## Twistlock scan result",
+              "",
+              f"**Image:** `{clean(result['image'])}`",
+              "",
+              "| Critical | High | Medium | Low | Total |",
+              "|---:|---:|---:|---:|---:|",
+              f"| {result['critical']} | {result['high']} | {result['medium']} | {result['low']} | {result['total']} |",
+          ]
+
+          if detail_rows:
+              lines.extend(
+                  [
+                      "",
+                      "### Vulnerability details",
+                      "",
+                      "| Microservice | CVE identifier | CVE ID | Severity | Date identified | Package |",
+                      "|---|---|---|---|---|---|",
+                  ]
+              )
+              for row in detail_rows[:100]:
+                  lines.append("| " + " | ".join(clean(value) for value in row) + " |")
+              if len(detail_rows) > 100:
+                  lines.extend(["", f"Showing 100 of {len(detail_rows)} findings."])
+          else:
+              lines.extend(["", "No vulnerabilities found."])
+
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
+              summary.write("\n".join(lines) + "\n")
+
+          if result["critical"] > 0 or result["high"] > 0:
+              raise SystemExit(
+                  "Twistlock policy failed: "
+                  f"critical={result['critical']}, high={result['high']}."
+              )
+          PYTHON
+
+      - name: Remove scanned image from runner
+        if: always()
+        run: docker image rm --force "${IMAGE_REF}" >/dev/null 2>&1 || true
+
+      - name: Validate TwistCLI completion
+        if: always()
+        env:
+          SCAN_EXIT_CODE: ${{ steps.twistlock.outputs.exit_code }}
+          SCAN_STEP_OUTCOME: ${{ steps.twistlock.outcome }}
+        run: |
+          set -Eeuo pipefail
+
+          if [[ "${SCAN_STEP_OUTCOME}" != "success" ]]; then
+            echo "Twistlock scan did not complete successfully." >&2
+            exit 1
+          fi
+
+          if [[ ! "${SCAN_EXIT_CODE}" =~ ^[0-9]+$ ]]; then
+            echo "Twistlock did not return a valid exit code." >&2
+            exit 1
+          fi
+
+          if (( SCAN_EXIT_CODE != 0 )); then
+            echo "TwistCLI failed with exit code ${SCAN_EXIT_CODE}." >&2
+            exit "${SCAN_EXIT_CODE}"
+          fi
+
+          echo "TwistCLI completed successfully."
