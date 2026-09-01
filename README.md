@@ -22,7 +22,15 @@ must be able to pull the requested ECR images and call
 `secretsmanager:GetSecretValue` for the configured secret. Add `kms:Decrypt`
 when the secret uses a customer-managed KMS key.
 
-Caller example—the image list is the only workflow input:
+Create a repository secret named `TWISTLOCK_SCANNER_AWS_ROLE_ARN` in each caller
+repository. The value must be a dedicated, least-privilege Twistlock scan role
+ARN. The ARN identifies the role; GitHub OIDC supplies short-lived AWS
+credentials only while the job runs. GitHub does not allow a caller workflow to
+pass an environment secret through `workflow_call`, so use a repository secret
+unless an approved organization secret is available.
+
+Caller example—the image list is the only scan-specific input. Set
+`environment` only when the caller uses a non-default GitHub environment:
 
 ```yaml
 jobs:
@@ -34,14 +42,26 @@ jobs:
     with:
       images: '["123456789012.dkr.ecr.us-east-1.amazonaws.com/service:tag"]'
       environment: build
+    secrets:
+      TWISTLOCK_SCANNER_AWS_ROLE_ARN: ${{ secrets.TWISTLOCK_SCANNER_AWS_ROLE_ARN }}
 ```
 
 The reusable workflow owns the fixed `us-east-1` region and `prod/twistlock`
-secret ID. Set `environment` to the caller environment that already contains
-`AWS_BUILD_ROLE_TO_ASSUME`. No Twistlock credential is stored in GitHub.
+secret ID. Set `environment` to the caller environment used by the AWS OIDC
+trust policy. No Twistlock username or password is stored in GitHub.
 
-If `AWS_BUILD_ROLE_TO_ASSUME` is a repository or organization secret instead of
-an environment secret, pass it with `secrets: inherit`.
+Pass the role secret explicitly as shown above. Do not use `secrets: inherit`:
+the reusable workflow needs only the Twistlock-specific role and does not use
+the caller's general build role. A secret stored only in this central repository
+is not passed to a remote reusable-workflow invocation; each caller must supply
+the named secret.
+
+The IAM role trust policy must restrict the GitHub OIDC `sub` claim to each
+approved caller repository, branch, or environment. Avoid organization-wide
+patterns such as `repo:CBIIT/*:*`. The role permission policy should contain
+only the required ECR pull actions, `secretsmanager:GetSecretValue` for
+`prod/twistlock`, and `kms:Decrypt` when the secret uses a customer-managed KMS
+key. Do not share a general PowerUser role for scanning.
 
 Use a release tag or full commit SHA instead of a test branch for team usage.
 If this repository is private, allow the intended organization repositories in
