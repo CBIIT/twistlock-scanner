@@ -10,10 +10,18 @@ name: Reusable Twistlock Image Scan
 #     with:
 #       images: '["123456789012.dkr.ecr.us-east-1.amazonaws.com/service:tag"]'
 #       environment: build
+#     secrets:
+#       TWISTLOCK_SCANNER_AWS_ROLE_ARN: ${{ secrets.TWISTLOCK_SCANNER_AWS_ROLE_ARN }}
 
 permissions:
   contents: read
   id-token: write
+
+env:
+  AWS_REGION: us-east-1
+  TWISTLOCK_URL: https://twistlock.nci.nih.gov
+  TWISTLOCK_SECRET_ID: prod/twistlock
+  INSECURE_TWISTCLI_DOWNLOAD: 'true'
 
 on:
   workflow_call:
@@ -22,35 +30,15 @@ on:
         description: 'JSON array of tagged ECR references; each entry can be fully qualified or repository:tag'
         required: true
         type: string
-      aws_region:
-        description: AWS region containing the ECR images and Twistlock secret
-        required: false
-        default: us-east-1
-        type: string
       environment:
-        description: Caller environment containing AWS_BUILD_ROLE_TO_ASSUME
+        description: Caller environment used for protection rules and the GitHub OIDC subject
         required: false
         default: build
         type: string
-      twistlock_url:
-        description: Prisma Cloud Compute (Twistlock) Console URL
-        required: false
-        default: https://twistlock.nci.nih.gov
-        type: string
-      twistlock_secret_id:
-        description: AWS Secrets Manager secret containing Twistlock username and password
-        required: false
-        default: prod/twistlock
-        type: string
-      insecure_twistcli_download:
-        description: Skip TLS certificate verification only while downloading twistcli
-        required: false
-        default: true
-        type: boolean
     secrets:
-      AWS_BUILD_ROLE_TO_ASSUME:
-        description: Optional repository or organization IAM role secret; environment secret takes precedence
-        required: false
+      TWISTLOCK_SCANNER_AWS_ROLE_ARN:
+        description: Dedicated least-privilege IAM role ARN used by the centralized Twistlock scanner
+        required: true
 
   workflow_dispatch:
     inputs:
@@ -58,31 +46,11 @@ on:
         description: 'JSON array of tagged ECR references; each entry can be fully qualified or repository:tag'
         required: true
         type: string
-      aws_region:
-        description: AWS region containing the ECR images and Twistlock secret
-        required: false
-        default: us-east-1
-        type: string
       environment:
-        description: GitHub environment containing AWS_BUILD_ROLE_TO_ASSUME
+        description: GitHub environment used for protection rules and the GitHub OIDC subject
         required: false
         default: build
         type: environment
-      twistlock_url:
-        description: Prisma Cloud Compute (Twistlock) Console URL
-        required: false
-        default: https://twistlock.nci.nih.gov
-        type: string
-      twistlock_secret_id:
-        description: AWS Secrets Manager secret containing Twistlock username and password
-        required: false
-        default: prod/twistlock
-        type: string
-      insecure_twistcli_download:
-        description: Skip TLS certificate verification only while downloading twistcli
-        required: false
-        default: true
-        type: boolean
 
 jobs:
   validate:
@@ -131,11 +99,8 @@ jobs:
       matrix:
         image: ${{ fromJSON(needs.validate.outputs.images) }}
     env:
-      AWS_REGION: ${{ inputs.aws_region }}
-      AWS_ROLE_TO_ASSUME: ${{ secrets.AWS_BUILD_ROLE_TO_ASSUME }}
+      AWS_ROLE_TO_ASSUME: ${{ secrets.TWISTLOCK_SCANNER_AWS_ROLE_ARN }}
       IMAGE_INPUT: ${{ matrix.image }}
-      TWISTLOCK_URL: ${{ inputs.twistlock_url }}
-      TWISTLOCK_SECRET_ID: ${{ inputs.twistlock_secret_id }}
 
     steps:
       - name: Validate scan inputs and runner
@@ -144,7 +109,7 @@ jobs:
           set -Eeuo pipefail
 
           if [[ -z "${AWS_ROLE_TO_ASSUME}" || -z "${TWISTLOCK_SECRET_ID}" ]]; then
-            echo "AWS_BUILD_ROLE_TO_ASSUME and twistlock_secret_id are required." >&2
+            echo "TWISTLOCK_SCANNER_AWS_ROLE_ARN and twistlock_secret_id are required." >&2
             exit 1
           fi
 
@@ -164,7 +129,7 @@ jobs:
       - name: Configure AWS credentials with OIDC
         uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502 # v4.0.2
         with:
-          aws-region: ${{ inputs.aws_region }}
+          aws-region: ${{ env.AWS_REGION }}
           role-to-assume: ${{ env.AWS_ROLE_TO_ASSUME }}
           role-session-name: GitHubActions-Twistlock
           unset-current-credentials: true
@@ -236,8 +201,6 @@ jobs:
           docker pull "${IMAGE_REF}"
 
       - name: Download twistcli from the internal Console
-        env:
-          INSECURE_DOWNLOAD: ${{ inputs.insecure_twistcli_download }}
         run: |
           set -Eeuo pipefail
 
@@ -250,7 +213,7 @@ jobs:
             --user "${TWISTLOCK_USERNAME}:${TWISTLOCK_PASSWORD}"
             --output "${twistcli_path}"
           )
-          if [[ "${INSECURE_DOWNLOAD}" == "true" ]]; then
+          if [[ "${INSECURE_TWISTCLI_DOWNLOAD}" == "true" ]]; then
             curl_args+=(--insecure)
           fi
 
