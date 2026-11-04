@@ -1,0 +1,10 @@
+{
+  "name": "twistlock-zero-high",
+  "version": "1.0.0",
+  "description": "Multi-agent harness that scans a Docker image (ECR or local) with Twistlock/Prisma Cloud and remediates the Dockerfile until Critical and High vulnerabilities are zero. Single-responsibility agents with sequential preflight checks.",
+  "author": {
+    "name": "CBIIT"
+  },
+  "license": "MIT",
+  "keywords": ["twistlock", "prisma-cloud", "docker", "security", "vulnerability", "harness"]
+}
