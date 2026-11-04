@@ -1,0 +1,13 @@
+{
+  "name": "cbiit-twistlock",
+  "owner": {
+    "name": "CBIIT"
+  },
+  "plugins": [
+    {
+      "name": "twistlock-zero-high",
+      "source": "./claude-plugin",
+      "description": "Scan a Docker image with Twistlock/Prisma Cloud and fix the Dockerfile until Critical/High are zero (ECR via Prefect, or local via twistcli)."
+    }
+  ]
+}
